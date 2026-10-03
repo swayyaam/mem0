@@ -26,6 +26,15 @@ from mem0.vector_stores.base import VectorStoreBase
 logger = logging.getLogger(__name__)
 
 
+def _client_is_local(client) -> bool:
+    """Whether a QdrantClient runs in local mode (embedded ``path`` or ``:memory:``)."""
+    options = getattr(client, "init_options", None)
+    if isinstance(options, dict):
+        return options.get("location") == ":memory:" or options.get("path") is not None
+    # Fallback for clients without init_options.
+    return type(getattr(client, "_client", None)).__name__ == "QdrantLocal"
+
+
 class Qdrant(VectorStoreBase):
     def __init__(
         self,
@@ -59,7 +68,7 @@ class Qdrant(VectorStoreBase):
         """
         if client:
             self.client = client
-            self.is_local = False
+            self.is_local = _client_is_local(client)
         else:
             params = {}
             if api_key:

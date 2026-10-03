@@ -2,7 +2,8 @@ import os
 import tempfile
 import unittest
 import uuid
-from unittest.mock import MagicMock, patch
+import warnings
+from unittest.mock import MagicMock, PropertyMock, patch
 
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
@@ -23,6 +24,7 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+from mem0.memory.main import AsyncMemory, Memory
 from mem0.vector_stores.qdrant import Qdrant
 
 
@@ -1065,3 +1067,108 @@ class TestQdrantDatetimeRangeFilters(unittest.TestCase):
         self.assertIn("mem0ai[extras]", joined)  # points at the right install
         self.assertNotIn("pip install fastembed", joined)  # not the bare package
         self.assertNotIn("\u2014", joined)  # no em-dash
+
+
+class TestEntityStoreSharedLocalClient(unittest.TestCase):
+    """#7527: the entity store reuses the main store's Qdrant client, so it must inherit its locality.
+
+    Uses a real local Qdrant in a temp dir. The embedder and LLM are mocked: building the
+    entity store never calls them.
+    """
+
+    PAYLOAD_INDEX_WARNING = "Payload indexes have no effect"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.config = {
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {"path": os.path.join(tmp.name, "qdrant"), "embedding_model_dims": 4},
+            },
+            "history_db_path": os.path.join(tmp.name, "history.db"),
+        }
+        for target in ("EmbedderFactory", "LlmFactory", "capture_event"):
+            patcher = patch(f"mem0.memory.main.{target}")
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch("mem0.memory.main.MEM0_TELEMETRY", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _memory(self, cls=Memory):
+        memory = cls.from_config(self.config)
+        # Registered after tmp.cleanup, so it runs first: local Qdrant holds its storage open.
+        self.addCleanup(memory.vector_store.client.close)
+        return memory
+
+    def test_entity_store_shares_client_and_inherits_local_flag(self):
+        memory = self._memory()
+        self.assertTrue(memory.vector_store.is_local)
+
+        self.assertIs(memory.entity_store.client, memory.vector_store.client)
+        self.assertTrue(memory.entity_store.is_local)
+
+    def test_async_entity_store_shares_client_and_inherits_local_flag(self):
+        memory = self._memory(AsyncMemory)
+
+        self.assertIs(memory.entity_store.client, memory.vector_store.client)
+        self.assertTrue(memory.entity_store.is_local)
+
+    def test_entity_store_skips_payload_indexes_and_warning_on_local_client(self):
+        memory = self._memory()
+        client = memory.vector_store.client
+
+        # qdrant-client shows this warning once per process; reset its record so the
+        # assertion holds regardless of which test triggered it first.
+        with (
+            patch("qdrant_client.common.client_warnings.SEEN_MESSAGES", set()),
+            patch.object(client, "create_payload_index", wraps=client.create_payload_index) as create_index,
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            memory.entity_store
+
+        create_index.assert_not_called()
+        self.assertFalse([w for w in caught if self.PAYLOAD_INDEX_WARNING in str(w.message)])
+
+    def test_entity_store_reset_clears_points_on_local_qdrant(self):
+        """The #6412 local sweep must also run for the entity store's collection."""
+        memory = self._memory()
+        store = memory.entity_store
+        store.insert(vectors=[[0.1, 0.2, 0.3, 0.4]], payloads=[{"data": "alice"}], ids=[str(uuid.uuid4())])
+        self.assertEqual(len(store.list(top_k=10)[0]), 1)
+
+        # Simulate Windows/NFS, where the collection dir survives delete_col() (see #6412).
+        with patch("qdrant_client.local.qdrant_local.shutil.rmtree"):
+            store.reset()
+
+        self.assertEqual(len(store.list(top_k=10)[0]), 0)
+
+    def test_local_client_passed_as_client_reports_local(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for label, make_client in (
+                ("path", lambda: QdrantClient(path=os.path.join(tmp, "qdrant"))),
+                ("memory", lambda: QdrantClient(location=":memory:")),
+            ):
+                with self.subTest(label):
+                    client = make_client()
+                    try:
+                        store = Qdrant(collection_name="c", embedding_model_dims=4, client=client)
+                        self.assertTrue(store.is_local)
+                    finally:
+                        client.close()
+
+    def test_remote_client_passed_as_client_reports_remote(self):
+        client = QdrantClient(url="http://localhost:6333", check_compatibility=False)
+        # create_col() would contact the server; locality is decided before it runs.
+        with patch.object(Qdrant, "create_col"):
+            store = Qdrant(collection_name="c", embedding_model_dims=4, client=client)
+        self.assertFalse(store.is_local)
+
+    def test_local_client_detected_without_init_options(self):
+        """Fallback for clients that don't expose init_options: check the underlying client type."""
+        client = QdrantClient(location=":memory:")
+        with patch.object(QdrantClient, "init_options", new_callable=PropertyMock, return_value=None):
+            store = Qdrant(collection_name="c", embedding_model_dims=4, client=client)
+        self.assertTrue(store.is_local)
